@@ -1,12 +1,13 @@
 /*
  * ESP32 Classic BT (SPP) + Wi-Fi Provisioning for Flutter App
  * Online-only 1Hz Sampling (MQ9 AO + VOC AO + PMS7003) → Firebase RTDB
- * 
+ *
  * 통신 프로토콜:
  * Flutter → ESP32:
  *   - "SCAN" : WiFi 스캔 요청
- *   - "CONNECT:SSID|PASSWORD" : WiFi 연결 요청
- * 
+ *   - "CONNECT:SSID|PASSWORD" : WiFi 연결 요청 (성공 시 NVS에 저장)
+ *   - "CLEAR_WIFI" : 저장된 WiFi 정보 삭제(초기화)
+ *
  * ESP32 → Flutter:
  *   - "WIFI_LIST_START" : WiFi 목록 시작
  *   - "WIFI:인덱스:SSID:신호강도:암호화타입" : WiFi 네트워크 정보
@@ -25,6 +26,7 @@
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 
+/************** 로깅 매크로 **************/
 #define LOGI(...) \
   do { \
     Serial.printf(__VA_ARGS__); \
@@ -56,8 +58,9 @@ struct PMSData {
 
 /************** 설정 **************/
 #define BT_NAME "green"
+#define BOOT_PIN 0  // BOOT 버튼은 GPIO0에 연결됨
 
-// Firebase RTDB
+// Firebase RTDB 엔드포인트 (asia-southeast1)
 static const char* HOST_PRIMARY = "jabswosseo-default-rtdb.asia-southeast1.firebasedatabase.app";
 static const char* HOST_BACKUP = "jabswosseo-default-rtdb.asia-southeast1.firebasedatabase.app";
 static const char* PATH_BASE = "/sensor_data_2.json";
@@ -96,13 +99,17 @@ volatile bool haveSample = false;
 PMSData lastPMS;
 volatile bool havePMS = false;
 
+/************** NVS 키 **************/
+static const char* PREF_NAMESPACE = "wifi";
+static const char* KEY_SSID = "ssid";
+static const char* KEY_PASS = "pass";
+
 /************** 시간(KST) **************/
 void initTimeKST() {
   configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
   setenv("TZ", "KST-9", 1);
   tzset();
 }
-
 bool isTimeSet() {
   time_t now = 0;
   time(&now);
@@ -127,7 +134,6 @@ String nowIso8601KST() {
            lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
   return String(b);
 }
-
 String nowDateTimeKey() {
   time_t now;
   time(&now);
@@ -141,6 +147,7 @@ String nowDateTimeKey() {
 
 /************** BT **************/
 void startClassicBT() {
+  if (btEnabled) return;
   if (!SerialBT.begin(BT_NAME)) {
     LOGE("[BT] begin failed");
     btEnabled = false;
@@ -149,7 +156,6 @@ void startClassicBT() {
     LOGI("[BT] SPP started: %s", BT_NAME);
   }
 }
-
 void stopClassicBT() {
   if (!btEnabled) return;
   SerialBT.end();
@@ -169,6 +175,7 @@ bool tryWiFiConnectOnce(const String& s, const String& p, uint32_t ms = 15000) {
   delay(120);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);  // 순간 끊김 완화
   WiFi.begin(s.c_str(), p.c_str());
 
   uint32_t t0 = millis();
@@ -178,9 +185,30 @@ bool tryWiFiConnectOnce(const String& s, const String& p, uint32_t ms = 15000) {
   }
   return WiFi.status() == WL_CONNECTED;
 }
-
 inline bool onlineReady() {
   return (WiFi.status() == WL_CONNECTED) && isTimeSet();
+}
+
+/************** Wi-Fi NVS 저장/로드 **************/
+void saveWiFi(const String& s, const String& p) {
+  prefs.begin(PREF_NAMESPACE, false);
+  prefs.putString(KEY_SSID, s);
+  prefs.putString(KEY_PASS, p);
+  prefs.end();
+  LOGI("[NVS] WiFi saved: ssid=\"%s\" (pw_len=%d)", s.c_str(), p.length());
+}
+bool loadSavedWiFi(String& s, String& p) {
+  prefs.begin(PREF_NAMESPACE, true);
+  s = prefs.getString(KEY_SSID, "");
+  p = prefs.getString(KEY_PASS, "");
+  prefs.end();
+  return s.length() > 0;
+}
+void clearWiFi() {
+  prefs.begin(PREF_NAMESPACE, false);
+  prefs.clear();
+  prefs.end();
+  LOGI("[NVS] WiFi cleared");
 }
 
 /************** TLS **************/
@@ -191,7 +219,7 @@ bool ensureClient(WiFiClientSecure& c, bool& flag, const char* host) {
   if (flag && c.connected()) return true;
   c.stop();
   c.setInsecure();
-  c.setTimeout(900);
+  c.setTimeout(5000);
   if (!c.connect(host, 443)) {
     flag = false;
     return false;
@@ -209,20 +237,22 @@ bool send_patch_keepalive(WiFiClientSecure& c, bool& flag, const char* host,
   }
 
   String body = "{\"" + it.key + "\":" + it.value + "}";
+
   c.printf("PATCH %s HTTP/1.1\r\n", path_json);
   c.printf("Host: %s\r\n", host);
   c.println("User-Agent: ESP32");
   c.println("Content-Type: application/json");
   c.printf("Content-Length: %d\r\n", body.length());
-  c.println("Connection: keep-alive\r\n");
+  c.println("Connection: keep-alive");
+  c.println();
   c.print(body);
 
+  // 간단 응답 파싱
   uint32_t t0 = millis();
   while (c.connected() && (millis() - t0 < 600)) {
     String line = c.readStringUntil('\n');
     if (line == "\r" || line.length() == 0) break;
   }
-
   String resp;
   t0 = millis();
   while (c.connected() && (millis() - t0 < 250)) {
@@ -234,7 +264,6 @@ bool send_patch_keepalive(WiFiClientSecure& c, bool& flag, const char* host,
     if (resp.length() > 0) break;
     delay(1);
   }
-
   if (resp.length() == 0) {
     LOGW("[RESP] empty(timeout)");
     c.stop();
@@ -244,11 +273,9 @@ bool send_patch_keepalive(WiFiClientSecure& c, bool& flag, const char* host,
   LOGI("[RESP] %s", resp.c_str());
   return true;
 }
-
 bool rtdb_patch_single_with_fallback(const SampleItem& it) {
   if (WiFi.status() != WL_CONNECTED) return false;
-  if (send_patch_keepalive(clientPri, priConnected, HOST_PRIMARY, PATH_BASE, it))
-    return true;
+  if (send_patch_keepalive(clientPri, priConnected, HOST_PRIMARY, PATH_BASE, it)) return true;
   LOGW("[HTTP] primary failed, try backup…");
   return send_patch_keepalive(clientBak, bakConnected, HOST_BACKUP, PATH_BASE, it);
 }
@@ -268,18 +295,17 @@ bool readPMS(PMSData& data) {
   data.pm1_0 = (buffer[10] << 8) | buffer[11];
   data.pm2_5 = (buffer[12] << 8) | buffer[13];
   data.pm10 = (buffer[14] << 8) | buffer[15];
-
   return true;
 }
 
 /************** JSON **************/
-String makeSampleValueJSON(float mq9_v, float voc_v, const PMSData& pms, bool havePMS) {
+String makeSampleValueJSON(float mq9_v, float voc_v, const PMSData& pms, bool hasPMS) {
   String ts = nowIso8601KST();
   String v = "{";
   v += "\"timestamp\":\"" + ts + "\"";
   v += ",\"MQ9_V\":" + String(mq9_v, 3);
   v += ",\"VOC_V\":" + String(voc_v, 3);
-  if (havePMS) {
+  if (hasPMS) {
     v += ",\"PM1_0\":" + String(pms.pm1_0);
     v += ",\"PM2_5\":" + String(pms.pm2_5);
     v += ",\"PM10\":" + String(pms.pm10);
@@ -295,16 +321,13 @@ void taskSample1Hz(void*) {
   TickType_t last;
 
   for (;;) {
-    while (!onlineReady()) {
-      vTaskDelay(pdMS_TO_TICKS(200));
-    }
+    while (!onlineReady()) { vTaskDelay(pdMS_TO_TICKS(200)); }
     vTaskDelay(pdMS_TO_TICKS(WARMUP_MS));
     last = xTaskGetTickCount();
 
     while (onlineReady()) {
       const float ADC_REF = 3.3f;
 
-      // MQ9 AO
       uint32_t acc1 = 0;
       for (int i = 0; i < 4; i++) {
         acc1 += analogRead(PIN_MQ9_AO);
@@ -312,7 +335,6 @@ void taskSample1Hz(void*) {
       }
       float mq9_v = (acc1 / 4.0f) * (ADC_REF / 4095.0f);
 
-      // VOC AO
       uint32_t acc2 = 0;
       for (int i = 0; i < 4; i++) {
         acc2 += analogRead(PIN_VOC_AO);
@@ -382,13 +404,12 @@ void doWiFiScanAndSend() {
       else if (authMode == WIFI_AUTH_WPA2_PSK) encType = "WPA2";
       else if (authMode == WIFI_AUTH_WPA_WPA2_PSK) encType = "WPA/WPA2";
 
-      // 형식: WIFI:인덱스:SSID:신호강도:암호화타입
       SerialBT.printf("WIFI:%d:%s:%d:%s\n",
                       i,
                       WiFi.SSID(i).c_str(),
                       WiFi.RSSI(i),
                       encType.c_str());
-      delay(10);  // 전송 안정성
+      delay(10);
     }
   }
 
@@ -400,33 +421,51 @@ void doWiFiScanAndSend() {
 void handleCommand(String cmd) {
   cmd.trim();
   if (cmd.length() == 0) return;
-
   LOGI("[CMD] Received: %s", cmd.c_str());
 
-  // SCAN 명령
   if (cmd == "SCAN") {
     doWiFiScanAndSend();
-  }
-  // CONNECT 명령: CONNECT:SSID|PASSWORD
-  else if (cmd.startsWith("CONNECT:")) {
+  } else if (cmd.startsWith("CONNECT:")) {
     String data = cmd.substring(8);  // "CONNECT:" 제거
     int sepIndex = data.indexOf('|');
 
     if (sepIndex > 0) {
       ssid_ = data.substring(0, sepIndex);
       pass_ = data.substring(sepIndex + 1);
-
-      LOGI("[CMD] Connect request - SSID: %s, Pass length: %d",
-           ssid_.c_str(), pass_.length());
-
+      LOGI("[CMD] Connect request - SSID: %s, Pass length: %d", ssid_.c_str(), pass_.length());
       state_ = TRY_CONNECT;
     } else {
       SerialBT.println("error:invalid connect format");
       LOGE("[CMD] Invalid CONNECT format");
     }
+  } else if (cmd == "CLEAR_WIFI") {
+    clearWiFi();
+    SerialBT.println("ok:cleared");
+  } else if (cmd == "REPROVISION") {
+    WiFi.disconnect(true);  // WiFi 끊기
+    clearWiFi();            // 저장된 SSID/PASS 삭제 (선택)
+    state_ = WAIT_COMMAND;  // 대기 상태로 전환
+    startClassicBT();       // Bluetooth 재시작
+    SerialBT.println("ok:reprovision");
+    LOGI("[CMD] Reprovision mode activated");
   } else {
     SerialBT.println("error:unknown command");
     LOGW("[CMD] Unknown command: %s", cmd.c_str());
+  }
+}
+void checkBootReset() {
+  if (digitalRead(BOOT_PIN) == LOW) {  // 버튼 눌림
+    unsigned long pressedAt = millis();
+    while (digitalRead(BOOT_PIN) == LOW) {
+      if (millis() - pressedAt > 3000) {
+        Serial.println("WiFi Reset Triggered!");
+        WiFi.disconnect(true, true);  // 저장된 WiFi 삭제
+        clearWiFi();                  // (NVS 삭제)
+        delay(500);
+        ESP.restart();
+      }
+      delay(10);
+    }
   }
 }
 
@@ -436,8 +475,10 @@ void setup() {
   delay(200);
   LOGI("[BOOT] setup() start, heap=%u", ESP.getFreeHeap());
 
+  // BLE 메모리 해제(클래식 BT만 사용)
   esp_bt_mem_release(ESP_BT_MODE_BLE);
-  startClassicBT();
+
+  // 센서/타이밍 초기화
   initTimeKST();
 
   analogReadResolution(12);
@@ -446,6 +487,30 @@ void setup() {
 
   pmsSerial.begin(9600, SERIAL_8N1, PMS_RX, PMS_TX);
 
+  // 1) 저장된 Wi-Fi로 자동 연결 시도 (BT 시작 전에)
+  {
+    String s, p;
+    if (loadSavedWiFi(s, p)) {
+      LOGI("[NVS] Saved WiFi found: %s", s.c_str());
+      if (tryWiFiConnectOnce(s, p, 10000)) {
+        String ip = WiFi.localIP().toString();
+        LOGI("[WiFi] Auto-connected! IP=%s", ip.c_str());
+        waitForTimeSyncAfterWiFi();
+        state_ = ONLINE;
+        // BT는 시작하지 않음(이미 온라인)
+      } else {
+        LOGW("[WiFi] Auto-connect failed → start BT provisioning");
+        startClassicBT();
+        state_ = WAIT_COMMAND;
+      }
+    } else {
+      LOGI("[NVS] No saved WiFi → start BT provisioning");
+      startClassicBT();
+      state_ = WAIT_COMMAND;
+    }
+  }
+
+  // 백그라운드 태스크 시작
   xTaskCreatePinnedToCore(taskSample1Hz, "Sample1Hz", 4096, nullptr, 2, nullptr, 0);
   xTaskCreatePinnedToCore(taskUpload1Hz, "Upload1Hz", 6144, nullptr, 1, nullptr, 1);
 
@@ -454,7 +519,8 @@ void setup() {
 }
 
 void loop() {
-  // Bluetooth 명령어 수신 처리
+  checkBootReset();
+  // Bluetooth 명령어 수신 처리 (연결 시도 중이 아닐 때)
   if (btEnabled && state_ != TRY_CONNECT) {
     while (SerialBT.available()) {
       char c = (char)SerialBT.read();
@@ -469,78 +535,72 @@ void loop() {
       rxLastMs_ = millis();
       yield();
     }
-
-    // 타임아웃 처리
     if (rxBuf_.length() > 0 && (millis() - rxLastMs_ > 1200)) {
       handleCommand(rxBuf_);
       rxBuf_.clear();
     }
   }
 
-  // WiFi 연결 시도
+  // WiFi 연결 시도 (CONNECT 명령 수신 후 1회)
   static bool tried = false;
   if (state_ == TRY_CONNECT && !tried) {
     tried = true;
     LOGI("[WiFi] Connecting to %s...", ssid_.c_str());
-
-    if (btEnabled) {
-      SerialBT.printf("Connecting to %s...\n", ssid_.c_str());
-    }
+    if (btEnabled) SerialBT.printf("Connecting to %s...\n", ssid_.c_str());
 
     bool ok = tryWiFiConnectOnce(ssid_, pass_, 15000);
 
     if (ok) {
+      // 성공 → NVS 저장
+      saveWiFi(ssid_, pass_);
+
       String ip = WiFi.localIP().toString();
       LOGI("[WiFi] Connected! IP=%s", ip.c_str());
-
       if (btEnabled) {
         SerialBT.printf("ip:%s\n", ip.c_str());
         SerialBT.println("ok:connected");
         delay(500);
       }
 
-      // ✅ 여기에 아래 코드 추가
+      // 간단 인터넷 확인 (선택)
       WiFiClient test;
-      if (test.connect("google.com", 80))
-        Serial.println("Internet OK");
-      else
-        Serial.println("Internet FAIL");
+      if (test.connect("google.com", 80)) Serial.println("Internet OK");
+      else Serial.println("Internet FAIL");
 
       waitForTimeSyncAfterWiFi();
       state_ = ONLINE;
-
-      if (btEnabled) {
-        stopClassicBT();
-      }
-
+      if (btEnabled) { stopClassicBT(); }
       LOGI("[NET] Online ready → sampling will start after warmup");
     } else {
       LOGW("[WiFi] Connection failed");
-
-      if (btEnabled) {
-        SerialBT.println("error:connection failed");
-      }
-
+      if (btEnabled) SerialBT.println("error:connection failed");
       state_ = WAIT_COMMAND;
-      tried = false;
-
-      // 연결 실패 시 Bluetooth 유지
+      tried = false;  // 실패 시 BT 유지
     }
   }
 
-  // 온라인 상태 모니터링
+  // 온라인 상태 모니터링: 5초 연속 offline 시 BT 프로비저닝 복귀
   static uint32_t lastChk = 0;
-  if (millis() - lastChk > 2000) {
+  static uint32_t offlineSince = 0;
+  if (millis() - lastChk > 1000) {
     lastChk = millis();
 
-    if (state_ == ONLINE && !onlineReady()) {
-      LOGW("[NET] Offline detected");
-      state_ = WAIT_COMMAND;
-      tried = false;
+    if (state_ == ONLINE) {
+      if (!onlineReady()) {
+        if (offlineSince == 0) offlineSince = millis();
+        uint32_t offlineDur = millis() - offlineSince;
 
-      if (!btEnabled) {
-        startClassicBT();
+        if (offlineDur > 5000) {
+          LOGW("[NET] Offline detected (5s confirmed) → fallback to BT");
+          state_ = WAIT_COMMAND;
+          tried = false;
+          if (!btEnabled) startClassicBT();
+        }
+      } else {
+        offlineSince = 0;
       }
+    } else {
+      offlineSince = 0;
     }
   }
 
