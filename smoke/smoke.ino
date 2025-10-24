@@ -185,8 +185,9 @@ bool tryWiFiConnectOnce(const String& s, const String& p, uint32_t ms = 15000) {
   }
   return WiFi.status() == WL_CONNECTED;
 }
+// ✅ 수정
 inline bool onlineReady() {
-  return (WiFi.status() == WL_CONNECTED) && isTimeSet();
+  return (WiFi.status() == WL_CONNECTED);  // NTP 제거
 }
 
 /************** Wi-Fi NVS 저장/로드 **************/
