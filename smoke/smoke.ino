@@ -92,6 +92,7 @@ String nowIso8601KST() {
            lt.tm_year+1900, lt.tm_mon+1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
   return String(b);
 }
+
 String nowDateTimeKey() {
   time_t now; time(&now);
   struct tm lt; localtime_r(&now, &lt);
@@ -115,6 +116,7 @@ void startClassicBT() {
     LOGE("[BT] begin failed"); btEnabled = false;
   } else { btEnabled = true; LOGI("[BT] SPP started: %s", BT_NAME); }
 }
+
 void stopClassicBT() {
   if (!btEnabled) return;
   SerialBT.end();
